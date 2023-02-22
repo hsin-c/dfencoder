@@ -167,6 +167,8 @@ class AutoEncoder(torch.nn.Module):
                  scaler='standard',
                  patience=5,
                  preset_cats=None,
+                 preset_numerical_scaler_params=None,
+                 binary_feature_list=None,
                  loss_scaler='standard',  # scaler for the losses (z score)
                  *args,
                  **kwargs):
@@ -184,6 +186,7 @@ class AutoEncoder(torch.nn.Module):
         self.decoder_dropout = decoder_dropout
         self.min_cats = min_cats
         self.preset_cats = preset_cats
+        self.preset_numerical_scaler_params = preset_numerical_scaler_params
         self.encoder = []
         self.decoder = []
         self.train_mode = self.train
@@ -196,7 +199,7 @@ class AutoEncoder(torch.nn.Module):
         self.binary_output = None
 
         self.num_names = []
-        self.bin_names = []
+        self.bin_names = binary_feature_list or []
 
         self.activation = activation
         self.optimizer = optimizer
@@ -235,6 +238,8 @@ class AutoEncoder(torch.nn.Module):
 
         self.n_megabatches = n_megabatches
 
+        self._ddp_params_and_buffers_to_ignore = []
+
     def get_scaler(self, name):
         scalers = {
             'standard': StandardScaler, 
@@ -245,22 +250,38 @@ class AutoEncoder(torch.nn.Module):
         }
         return scalers[name]
 
-    def init_numeric(self, df):
-        dt = df.dtypes
-        numeric = []
-        numeric += list(dt[dt == int].index)
-        numeric += list(dt[dt == float].index)
+    def init_numeric(self, df=None):
+        if df is None and self.preset_numerical_scaler_params is None:
+            raise ValueError('Either `df` or `self.preset_numerical_scaler_params` needs to be provided.')
+        
+        if self.preset_numerical_scaler_params:
+            if self.verbose:
+                print('Using `self.preset_numerical_scaler_params` to override the numerical scalers...')
+            for ft, scaler_params in self.preset_numerical_scaler_params.items():
+                # scaler_params should include the following keys: scaler_type, scaler_attr_dict, mean, std
+                scaler = self.get_scaler(scaler_params.get('scaler_type', 'gauss_rank'))()
+                for k, v in scaler_params['scaler_attr_dict'].items():
+                    # scaler_params['scaler_attr_dict'] should be a dict including all the class attributes of a fitted scaler class
+                    setattr(scaler, k, v)
+                feature = {'mean': scaler_params['mean'], 'std': scaler_params['std'], 'scaler': scaler}
+                self.numeric_fts[ft] = feature
+        else:
+            # initialize using a dataframe
+            dt = df.dtypes
+            numeric = []
+            numeric += list(dt[dt == int].index)
+            numeric += list(dt[dt == float].index)
 
-        if isinstance(self.scaler, str):
-            scalers = {ft: self.scaler for ft in numeric}
-        elif isinstance(self.scaler, dict):
-            scalers = self.scaler
+            if isinstance(self.scaler, str):
+                scalers = {ft: self.scaler for ft in numeric}
+            elif isinstance(self.scaler, dict):
+                scalers = self.scaler
 
-        for ft in numeric:
-            Scaler = self.get_scaler(scalers.get(ft, 'gauss_rank'))
-            feature = {'mean': df[ft].mean(), 'std': df[ft].std(), 'scaler': Scaler()}
-            feature['scaler'].fit(df[ft][~df[ft].isna()].values)
-            self.numeric_fts[ft] = feature
+            for ft in numeric:
+                Scaler = self.get_scaler(scalers.get(ft, 'gauss_rank'))
+                feature = {'mean': df[ft].mean(), 'std': df[ft].std(), 'scaler': Scaler()}
+                feature['scaler'].fit(df[ft][~df[ft].isna()].values)
+                self.numeric_fts[ft] = feature
 
         self.num_names = list(self.numeric_fts.keys())
 
@@ -327,9 +348,20 @@ class AutoEncoder(torch.nn.Module):
             feature['cats'] = cats
             self.categorical_fts[ft] = feature
 
-    def init_binary(self, df):
-        dt = df.dtypes
-        binaries = list(dt[dt == bool].index)
+    def init_binary(self, df=None):
+        if df is None and self.bin_names is None:
+            raise ValueError('Need to provide one of the two params (df or binary_features). \
+                If there is no binary feartures, try providing the parameter `binary_feature_list=[]` during class init.')
+        
+        if self.bin_names is not None:
+            if self.verbose:
+                print('Using the preset binary feature list `self.bin_names` to initialize the binary features...')
+            binaries = self.bin_names
+        else:
+            dt = df.dtypes
+            binaries = list(dt[dt == bool].index)
+            self.bin_names = binaries
+
         for ft in self.binary_fts:
             feature = self.binary_fts[ft]
             for i, cat in enumerate(feature['cats']):
@@ -341,10 +373,10 @@ class AutoEncoder(torch.nn.Module):
             feature[False] = False
             self.binary_fts[ft] = feature
 
-        self.bin_names = list(self.binary_fts.keys())
-
-    def init_features(self, df):
+    def init_features(self, df=None):
         if self.preset_cats is not None:
+            if self.verbose:
+                print('Using the preset categories `self.preset_cats` to initialize the categories features...')
             self.categorical_fts = self.preset_cats
         else:
             self.init_cats(df)
@@ -374,15 +406,20 @@ class AutoEncoder(torch.nn.Module):
 
     def build_outputs(self, dim):
         self.numeric_output = torch.nn.Linear(dim, len(self.numeric_fts))
+        if len(self.numeric_fts) == 0:
+            self._ddp_params_and_buffers_to_ignore.append('numeric_output.weight')
+
         self.binary_output = torch.nn.Linear(dim, len(self.binary_fts))
+        if len(self.binary_fts) == 0:
+            self._ddp_params_and_buffers_to_ignore.append('binary_output.weight')
 
         for ft in self.categorical_fts:
             feature = self.categorical_fts[ft]
             cats = feature['cats']
             layer = torch.nn.Linear(dim, len(cats) + 1)
             feature['output_layer'] = layer
-            self.add_module(f'{ft} output', layer)
-
+            self.add_module(f'{ft}_output', layer)
+        
     def prepare_df(self, df):
         """
         Does data preparation on copy of input dataframe.
@@ -408,10 +445,10 @@ class AutoEncoder(torch.nn.Module):
 
         return output_df
 
-    def build_optimizer(self):
+    def build_optimizer(self, distributed_model=None):
 
         lr = self.lr
-        params = self.parameters()
+        params = self.parameters() if distributed_model is None else distributed_model.parameters()
         if self.optimizer == 'adam':
             return torch.optim.Adam(params,
                                     lr=self.lr,
@@ -428,7 +465,7 @@ class AutoEncoder(torch.nn.Module):
                 weight_decay=self.weight_decay,
             )
 
-    def build_model(self, df):
+    def build_model(self, df=None):
         """
         Takes a pandas dataframe as input.
         Builds autoencoder model.
@@ -480,10 +517,10 @@ class AutoEncoder(torch.nn.Module):
         # set up predictive outputs
         self.build_outputs(dim)
 
-        # get optimizer
-        self.optim = self.build_optimizer()
-        if self.lr_decay is not None:
-            self.lr_decay = torch.optim.lr_scheduler.ExponentialLR(self.optim, self.lr_decay)
+        # # get optimizer
+        # self.optim = self.build_optimizer()
+        # if self.lr_decay is not None:
+        #     self.lr_decay = torch.optim.lr_scheduler.ExponentialLR(self.optim, self.lr_decay)
 
         cat_names = list(self.categorical_fts.keys())
         fts = self.num_names + self.bin_names + cat_names
@@ -562,23 +599,34 @@ class AutoEncoder(torch.nn.Module):
         return num, bin, cat
 
     def compute_loss(self, num, bin, cat, target_df, logging=True, _id=False):
+        num_target, bin_target, codes = self.compute_targets(target_df)
+        return self.compute_loss_from_targets(
+            num=num, 
+            bin=bin, 
+            cat=cat, 
+            num_target=num_target, 
+            bin_target=bin_target, 
+            cat_target=codes, 
+            logging=logging,
+            _id=_id,
+        )
+
+    def compute_loss_from_targets(self, num, bin, cat, num_target, bin_target, cat_target, logging=True, _id=False):
         if logging:
             if self.logger is not None:
                 logging = True
             else:
                 logging = False
         net_loss = []
-        num_target, bin_target, codes = self.compute_targets(target_df)
         mse_loss = self.mse(num, num_target)
         net_loss += list(mse_loss.mean(dim=0).cpu().detach().numpy())
         mse_loss = mse_loss.mean()
         bce_loss = self.bce(bin, bin_target)
-
         net_loss += list(bce_loss.mean(dim=0).cpu().detach().numpy())
         bce_loss = bce_loss.mean()
         cce_loss = []
         for i, ft in enumerate(self.categorical_fts):
-            loss = self.cce(cat[i], codes[i])
+            loss = self.cce(cat[i], cat_target[i])
             loss = loss.mean()
             cce_loss.append(loss)
             val = loss.cpu().item()
@@ -590,7 +638,6 @@ class AutoEncoder(torch.nn.Module):
                 self.logger.id_val_step(net_loss)
             elif not self.training:
                 self.logger.val_step(net_loss)
-
         net_loss = np.array(net_loss).mean()
         return mse_loss, bce_loss, cce_loss, net_loss
 
@@ -660,17 +707,18 @@ class AutoEncoder(torch.nn.Module):
                 use_val_for_loss_stats is set to True."
             )
 
-        if use_val_for_loss_stats:
-            df_for_loss_stats = val.copy()
-        else:
-            # use train loss
-            df_for_loss_stats = df.copy()
+        # if use_val_for_loss_stats:
+        #     df_for_loss_stats = val.copy()
+        # else:
+        #     # use train loss
+        #     df_for_loss_stats = df.copy()
 
         if run_validation and val is not None:
             val = val.copy()
 
-        if self.optim is None:
-            self.build_model(df)
+        # if self.optim is None:
+        #     self.build_model(df)
+
         if self.n_megabatches == 1:
             df = self.prepare_df(df)
 
@@ -682,7 +730,6 @@ class AutoEncoder(torch.nn.Module):
             baseline = self.compute_baseline_performance(val_in, val_df)
             if self.verbose:
                 print(msg)
-            result = []
             val_batches = len(val_df) // self.eval_batch_size
             if len(val_df) % self.eval_batch_size != 0:
                 val_batches += 1
@@ -769,6 +816,8 @@ class AutoEncoder(torch.nn.Module):
                         msg += f"{round(id_loss, 4)} \n\n\n"
                         print(msg)
 
+
+    def populate_loss_stats(self, df_for_loss_stats):
         #Getting training loss statistics
         # mse_loss, bce_loss, cce_loss, _ = self.get_anomaly_score(pdf) if pdf_val is None else self.get_anomaly_score(pd.concat([pdf, pdf_val]))
         mse_loss, bce_loss, cce_loss, _ = self.get_anomaly_score_with_losses(df_for_loss_stats)
@@ -781,6 +830,68 @@ class AutoEncoder(torch.nn.Module):
         for i, ft in enumerate(self.categorical_fts):
             i_loss = cce_loss[:, i]
             self.feature_loss_stats[ft] = self._create_stat_dict(i_loss)
+
+    def fit_batch(
+        self, input_swapped, num_target, bin_target, cat_target
+    ):  
+        num, bin, cat = self.forward(input_swapped)
+        mse, bce, cce, net_loss = self.compute_loss_from_targets(
+            num=num, 
+            bin=bin, 
+            cat=cat, 
+            num_target=num_target, 
+            bin_target=bin_target, 
+            cat_target=cat_target, 
+            logging=True,
+        )
+        self.do_backward(mse, bce, cce)
+        self.optim.step()
+        self.optim.zero_grad()
+        return net_loss
+
+    def validate_batch(self, input_original, input_swapped, num_target, bin_target, cat_target):
+        orig_num, orig_bin, orig_cat = self.forward(input_original)
+        _, _, _, orig_net_loss = self.compute_loss_from_targets(
+            num=orig_num, 
+            bin=orig_bin, 
+            cat=orig_cat, 
+            num_target=num_target, 
+            bin_target=bin_target, 
+            cat_target=cat_target, 
+            logging=True,
+        )
+        
+        num, bin, cat = self.forward(input_swapped)
+        _, _, _, net_loss = self.compute_loss_from_targets(
+            num=num, 
+            bin=bin, 
+            cat=cat, 
+            num_target=num_target, 
+            bin_target=bin_target, 
+            cat_target=cat_target, 
+            logging=True,
+        )
+        return orig_net_loss, net_loss
+
+    def run_validation(self, val_dataset, rank=None):
+        self.eval()
+        with torch.no_grad():
+            swapped_loss = []
+            id_loss = []
+            for step, data_d in enumerate(val_dataset):
+                # if self.verbose:
+                #     print(f'Validating batch {step}... (batch size: {self.eval_batch_size})')
+                orig_net_loss, net_loss = self.validate_batch(**data_d['data'])
+                id_loss.append(orig_net_loss)
+                swapped_loss.append(net_loss)
+
+            swapped_loss = np.array(swapped_loss).mean()
+            id_loss = np.array(id_loss).mean()
+
+            if self.verbose:
+                rank_str = '' if rank is None else f'R{rank} '
+                print(f'\t{rank_str}Swapped loss: {round(swapped_loss, 4)}, Orig. loss: {round(id_loss, 4)}')
+        return id_loss
 
     def train_epoch(self, n_updates, input_df, df, pbar=None):
         """Run regular epoch."""
