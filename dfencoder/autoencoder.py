@@ -51,6 +51,7 @@ import numpy as np
 import pandas as pd
 import torch
 import tqdm
+from collections import defaultdict
 
 from .dataframe import EncoderDataFrame
 from .logging import BasicLogger, IpynbLogger, TensorboardXLogger
@@ -707,11 +708,11 @@ class AutoEncoder(torch.nn.Module):
                 use_val_for_loss_stats is set to True."
             )
 
-        # if use_val_for_loss_stats:
-        #     df_for_loss_stats = val.copy()
-        # else:
-        #     # use train loss
-        #     df_for_loss_stats = df.copy()
+        if use_val_for_loss_stats:
+            df_for_loss_stats = val.copy()
+        else:
+            # use train loss
+            df_for_loss_stats = df.copy()
 
         if run_validation and val is not None:
             val = val.copy()
@@ -816,8 +817,6 @@ class AutoEncoder(torch.nn.Module):
                         msg += f"{round(id_loss, 4)} \n\n\n"
                         print(msg)
 
-
-    def populate_loss_stats(self, df_for_loss_stats):
         #Getting training loss statistics
         # mse_loss, bce_loss, cce_loss, _ = self.get_anomaly_score(pdf) if pdf_val is None else self.get_anomaly_score(pd.concat([pdf, pdf_val]))
         mse_loss, bce_loss, cce_loss, _ = self.get_anomaly_score_with_losses(df_for_loss_stats)
@@ -893,6 +892,98 @@ class AutoEncoder(torch.nn.Module):
                 print(f'\t{rank_str}Swapped loss: {round(swapped_loss, 4)}, Orig. loss: {round(id_loss, 4)}')
         return id_loss
 
+    def populate_loss_stats_from_dataset(self, dataset):
+        self.eval()
+        feature_losses = self.get_feature_losses_from_dataset(dataset)
+        # populate loss stats
+        for ft, losses in feature_losses.items():
+            loss = losses.cpu().numpy()
+            self.feature_loss_stats[ft] = self._create_stat_dict(loss)
+
+    def get_feature_losses_from_dataset(self, dataset):
+        # return a dict mapping feature names to a tensor of losses
+        feature_losses = defaultdict(list)
+        with torch.no_grad():
+            for step, data_d in enumerate(dataset):
+                # if self.verbose:
+                #     print(f'Validating batch {step}... (batch size: {self.eval_batch_size})')
+                batch_feature_losses, _ = self.get_batch_feature_losses_and_output(**data_d['data'], include_output_df=False)
+                for ft, loss_l in batch_feature_losses.items():
+                    feature_losses[ft].append(loss_l)
+        return {ft: torch.cat(tensor_l, dim=0) for ft, tensor_l in feature_losses.items()}
+
+    def get_batch_feature_losses_and_output(self, input_original, input_swapped, num_target, bin_target, cat_target, include_output_df=True):
+        batch_feature_losses = {}
+
+        encoding = self.encode(input_original)
+        num, bin, cat = self.decode(encoding)
+        mse_loss = self.mse(num, num_target)
+        for i, ft in enumerate(self.numeric_fts):
+            batch_feature_losses[ft] = mse_loss[:, i]
+
+        bce_loss = self.bce(bin, bin_target)
+        for i, ft in enumerate(self.binary_fts):
+            batch_feature_losses[ft] = bce_loss[:, i]
+
+        for i, ft in enumerate(self.categorical_fts):
+            loss = self.cce(cat[i], cat_target[i])
+            batch_feature_losses[ft] = loss
+            
+        if include_output_df:
+            output_df = self.decode_to_df(encoding)
+        else:
+            output_df = None
+        return batch_feature_losses, output_df
+
+    def get_results_from_dataset(self, dataset, preloaded_df=None, return_abs=False):
+        df = preloaded_df if preloaded_df is not None else dataset.get_preloaded_data()
+        result = pd.DataFrame()
+
+        if self.verbose:
+            print(f'Getting inference results... (total of {len(dataset)} batches)')
+
+        self.eval()
+        feature_losses = defaultdict(list)
+        output_df = []
+        with torch.no_grad():
+            for step, data_d in enumerate(dataset):
+                if self.verbose:          
+                    print(f'\tinferencing batch {step}...')
+                batch_feature_losses, batch_output_df = self.get_batch_feature_losses_and_output(**data_d['data'], include_output_df=True)
+                for ft, loss_l in batch_feature_losses.items():
+                    feature_losses[ft].append(loss_l)
+                output_df.append(batch_output_df)
+    
+        if self.verbose:
+            print(f'\tdone running inference. making output df...')
+        
+        feature_losses = {ft: torch.cat(tensor_l, dim=0) for ft, tensor_l in feature_losses.items()}
+        output_df = pd.concat(output_df).reset_index(drop=True)
+
+        for ft, loss_tensor in feature_losses.items():
+            result[ft] = df[ft]
+            result[ft + '_pred'] = output_df[ft]
+            result[ft + '_loss'] = loss_tensor.cpu().numpy()
+            z_loss = self.feature_loss_stats[ft]['scaler'].transform(loss_tensor)
+            if return_abs:
+                z_loss = abs(z_loss)
+            result[ft + '_z_loss'] = z_loss.cpu().numpy()
+        
+        result['max_abs_z'] = result[[f'{ft}_z_loss' for ft in feature_losses]].max(axis=1)
+        result['mean_abs_z'] = result[[f'{ft}_z_loss' for ft in feature_losses]].mean(axis=1)
+
+        # add a column describing the scaler of the losses
+        if self.loss_scaler_str == 'standard':
+            output_scaled_loss_str = 'z'
+        elif self.loss_scaler_str == 'modified':
+            output_scaled_loss_str = 'modz'
+        else:
+            # in case other custom scaling is used
+            output_scaled_loss_str = f'{self.loss_scaler_str}_scaled' 
+        result['z_loss_scaler_type'] = output_scaled_loss_str
+
+        return result
+        
     def train_epoch(self, n_updates, input_df, df, pbar=None):
         """Run regular epoch."""
 
@@ -1173,7 +1264,7 @@ class AutoEncoder(torch.nn.Module):
             cce_scaled[:, i] = self.feature_loss_stats[ft]['scaler'].transform(cce[:, i])
 
         return mse_scaled, bce_scaled, cce_scaled
-
+    
     def get_results(self, df, return_abs=False):
         pdf = pd.DataFrame()
         self.eval()

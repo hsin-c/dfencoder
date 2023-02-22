@@ -1,16 +1,26 @@
 import os
+import time
 import numpy as np
+import itertools
+from datetime import datetime
+import argparse
 import pandas as pd
-from collections import defaultdict
+import tqdm
 import json
 import torch.multiprocessing as mp
+import torchvision
+import torchvision.transforms as transforms
 import torch
+import torch.nn as nn
 import torch.distributed as dist
+import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.data import Dataset, DataLoader
 
 from dfencoder.autoencoder import AutoEncoder, EncoderDataFrame
+from collections import defaultdict
+
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
 FEATURE_COLUMNS = [
@@ -29,7 +39,9 @@ FEATURE_COLUMNS = [
 ]
 INFO_COLUMNS = ['user', 'time', 'comb_risk_level_med_high', 'signin_risk_level_med_high', 'agg_risk_level_med_high', 'individual_model']
 OUTPUT_DIR = 'train_result_0221'
-
+TRAIN_FOLDER = 'train_data'
+VALIDATION_FOLDER = 'validation_data'
+INFERENCE_FOLDER = 'inference_data'
 
 class MyDataLoader(DataLoader):
     def __init__(self, *args, **kwargs):
@@ -129,10 +141,16 @@ class MyDataset(Dataset):
             data_d['input_original'] = self.model.build_input_tensor(df)
         return {'batch_index': batch_index, 'data': data_d}
 
-def prepare(
+    def get_preloaded_data(self):
+        if self.preloaded_data is None:
+            return None
+        return pd.concat(pdf for pdf in self.preloaded_data.values())
+
+def get_training_dataloader(
     model, data_folder, data_load_batch_size, rank, world_size, shuffle=True, pin_memory=False, num_workers=0
 ):
-    dataset = MyDataset(data_folder, data_load_batch_size, model=model)
+    dataset = MyDataset(data_folder, data_load_batch_size, model=model, 
+    shuffle_rows_in_batch=True, preload_data_into_memory=False, include_original_input_tensor=False)
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle, drop_last=False)
     dataloader = MyDataLoader(dataset, batch_size=1, pin_memory=pin_memory, num_workers=num_workers, drop_last=False, shuffle=False, sampler=sampler)
     return dataloader
@@ -143,6 +161,18 @@ def get_validation_dataset(data_folder, model):
     dataset = MyDataset(
         data_folder, 
         model.eval_batch_size, 
+        model, 
+        shuffle_rows_in_batch=False, 
+        preload_data_into_memory=True,
+        include_original_input_tensor=True,
+    )
+    return dataset
+
+def get_inference_dataset(data_folder, model, inf_batch_size):
+    # loading the whole set into memory assuming host memory is big enough
+    dataset = MyDataset(
+        data_folder, 
+        inf_batch_size, 
         model, 
         shuffle_rows_in_batch=False, 
         preload_data_into_memory=True,
@@ -168,7 +198,7 @@ def main(rank, world_size):
     print(f"Running basic DDP example on rank {rank}.")
 
     setup(rank, world_size)
-    
+
     preset_cats = json.load(open('azure_202302040659_preset_cats_0207.json', 'r'))
     preset_numerical_scaler_params = {
         'log_count': {
@@ -198,7 +228,7 @@ def main(rank, world_size):
         swap_p=0.2, #noise parameter
         lr = 0.01, # learning rate
         lr_decay=0.99, # learning decay
-        batch_size=512,
+        batch_size=2048,
         logger='basic', 
         verbose=True,
         progress_bar=False,
@@ -209,7 +239,8 @@ def main(rank, world_size):
         preset_numerical_scaler_params=preset_numerical_scaler_params,
         binary_feature_list=[],
         preset_cats=preset_cats,
-        eval_batch_size=100000,
+        eval_batch_size=100000, # as big as possible to save time
+        patience=5,
     )
     model.build_model()
 
@@ -221,18 +252,20 @@ def main(rank, world_size):
         model.lr_decay = torch.optim.lr_scheduler.ExponentialLR(model.optim, model.lr_decay)
 
     # prepare the dataloader
-    dataloader = prepare(model, data_folder='train_data/', data_load_batch_size=1024, rank=rank, world_size=world_size)
+    dataloader = get_training_dataloader(model, data_folder=TRAIN_FOLDER, data_load_batch_size=1024, rank=rank, world_size=world_size)
     # load validation set
-    val_dataset = get_validation_dataset('validation_data', model)
+    val_dataset = get_validation_dataset(VALIDATION_FOLDER, model)
 
     model.train()
     # early stopping
     count_es = 0
     last_net_loss = float('inf')
-    losses_stats = defaultdict(list)
-    for epoch in range(2):
+    rank_stats = defaultdict(list)
+    start_time = time.time()
+    for epoch in range(30):
+        epoch_start = time.time()
         if model.verbose:
-            print(f'\nR{rank} training epoch {epoch + 1}...')
+            print(f'\nR{rank} training epoch {epoch + 1}... ({len(dataloader.dataset)}) batches)')
         # if we are using DistributedSampler, we have to tell it which epoch this is
         dataloader.sampler.set_epoch(epoch)       
         
@@ -244,11 +277,13 @@ def main(rank, world_size):
             train_loss_count += 1
             train_loss_sum += loss
 
-            if step>10:
-                break
-
+            if step % 10 == 0:
+                print(f'\tR{rank} {epoch}-th epoch, processed {step} batches...')
+        
         if model.lr_decay is not None:
             model.lr_decay.step()
+
+        train_done_time = time.time()
 
         # run validation
         curr_net_loss = model.run_validation(val_dataset, rank)
@@ -268,25 +303,79 @@ def main(rank, world_size):
             count_es = 0
         last_net_loss = curr_net_loss
 
+        validation_done_time = time.time()
+
         model.logger.end_epoch()
-        losses_stats[f'rank_{rank}'].append({
+        rank_stats[f'rank_{rank}'].append({
             'epoch': epoch,
             'train_loss': train_loss_sum/train_loss_count,
             'val_loss': curr_net_loss,
+            'train_time_sec': train_done_time - epoch_start,
+            'validation_time_sec': validation_done_time - train_done_time,
         })
 
+    all_training_end_time = time.time()
+    rank_stats[f'rank_{rank}'].append({
+            'epoch': 'final_stats',
+            'processing_time_sec': all_training_end_time - start_time,
+    })
     # we have to create enough room to store the collected objects
-    outputs = [None for _ in range(world_size)]
+    stats = [None for _ in range(world_size)]
     # the first argument is the collected lists, the second argument is the data unique in each process
-    dist.all_gather_object(outputs, losses_stats)
-    if rank == 0:
-        print(json.dumps(outputs, indent=4)) 
+    dist.all_gather_object(stats, rank_stats)
 
+    if rank == 0:
+        print(json.dumps(stats, indent=4)) 
+        model.populate_loss_stats_from_dataset(val_dataset)
+        
+        # Inference
+        result = run_inference(model, INFERENCE_FOLDER)
+        inference_done_time = time.time()
+
+        json.dump(stats, open(f'{OUTPUT_DIR}/statistics_by_rank.json', 'w'))
+        result.to_csv(f'{OUTPUT_DIR}/inference_result.csv', index=False)
+        write_done_time = time.time()
+
+        json.dump(
+            {
+                'inference_time_sec': inference_done_time - all_training_end_time,
+                'write_time_sec': write_done_time - inference_done_time,
+            },
+            open(f'{OUTPUT_DIR}/inference_time_stats.json', 'w')
+        )
+        
     cleanup()
     return
-        
-if __name__ == '__main__':
+
+def run_inference(model, inference_folder):
+    start = time.time()
+    inf_dataset = get_inference_dataset(inference_folder, model, inf_batch_size=2**17)
+    inference = inf_dataset.get_preloaded_data()
+    load_time = time.time()
+    print('\t\tInference data loading done ({} sec)'.format(round(load_time - start, 2)))
     
+    result = (
+        model
+        .get_results_from_dataset(inf_dataset, preloaded_df=inference, return_abs=True)
+        .join(
+            inference[INFO_COLUMNS], 
+            how='inner', 
+            rsuffix='_'
+        )
+    )
+    inference_time = time.time()
+    print('\t\tInference done ({} sec)'.format(round(inference_time - load_time, 2)))
+
+    result.fillna('nan', inplace=True)
+    result['date'] = result.time.str[:10]
+    result['anomaly_score'] = result['mean_abs_z']
+    return result
+
+
+if __name__ == '__main__':
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+
     world_size = 2
 
     print("We have available ", torch.cuda.device_count(), "GPUs! but using ",world_size," GPUs")
